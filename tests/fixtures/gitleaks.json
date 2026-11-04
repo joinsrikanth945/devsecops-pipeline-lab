@@ -1,0 +1,3 @@
+[
+  {"RuleID": "github-pat", "Description": "GitHub Personal Access Token", "File": "demo/settings.env", "Commit": "abc123", "Secret": "REDACTED", "StartLine": 1}
+]

@@ -1,0 +1,8 @@
+{"SchemaVersion": 2, "ArtifactName": "bkimminich/juice-shop@sha256:demo", "ArtifactType": "container_image",
+ "Results": [
+  {"Target": "app (node-pkg)", "Class": "lang-pkgs", "Vulnerabilities": [
+    {"VulnerabilityID": "CVE-2000-0001", "PkgName": "demo-a", "Severity": "CRITICAL"},
+    {"VulnerabilityID": "CVE-2000-0002", "PkgName": "demo-b", "Severity": "HIGH"},
+    {"VulnerabilityID": "CVE-2000-0003", "PkgName": "demo-c", "Severity": "HIGH"}]},
+  {"Target": "os", "Class": "os-pkgs"}
+ ]}

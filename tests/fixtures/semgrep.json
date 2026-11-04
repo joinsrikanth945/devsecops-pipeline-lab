@@ -1,0 +1,5 @@
+{"results": [
+  {"check_id": "javascript.sequelize.security.audit.sequelize-injection-express", "path": "app/routes/login.ts", "extra": {"severity": "ERROR", "message": "SQL injection"}},
+  {"check_id": "javascript.express.security.audit.express-open-redirect", "path": "app/routes/redirect.ts", "extra": {"severity": "WARNING", "message": "Open redirect"}},
+  {"check_id": "javascript.lang.correctness.useless-assign", "path": "app/lib/utils.ts", "extra": {"severity": "INFO", "message": "Useless assignment"}}
+], "errors": [], "paths": {"scanned": ["app/routes/login.ts"]}}
