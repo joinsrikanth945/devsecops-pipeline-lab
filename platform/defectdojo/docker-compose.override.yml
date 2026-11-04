@@ -1,0 +1,9 @@
+# Copy this file into your clone of DefectDojo/django-DefectDojo, next to its
+# docker-compose.yml. Docker Compose loads it automatically and replaces the
+# web ports so DefectDojo listens on the VM's localhost only.
+# Check the service name first:  docker compose config --services   (expects "nginx")
+# Requires Docker Compose 2.24 or newer for the !override tag.
+services:
+  nginx:
+    ports: !override
+      - "127.0.0.1:8080:8080"
