@@ -1,0 +1,107 @@
+# Alerts stack: Kafka (single node, KRaft), Kafka UI, Mattermost + Postgres,
+# and our own receiver and worker. Every port is bound to 127.0.0.1 only:
+# reach the web pages from your PC through the SSH tunnel.
+name: alerts
+
+services:
+  kafka:
+    image: apache/kafka:${KAFKA_TAG:-3.9.0}
+    restart: unless-stopped
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"   # topics are created on purpose by create-topics.sh
+    # No volume on purpose: Kafka keeps its data while the container exists
+    # (stop/start is fine). "docker compose down" deletes topics and messages.
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  kafka-ui:
+    image: ghcr.io/kafbat/kafka-ui:${KAFKA_UI_TAG:-v1.5.0}
+    restart: unless-stopped
+    depends_on:
+      kafka: { condition: service_healthy }
+    environment:
+      KAFKA_CLUSTERS_0_NAME: tutorial
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    ports:
+      - "127.0.0.1:8081:8080"
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: mmuser
+      POSTGRES_PASSWORD: ${MM_DB_PASSWORD:?set MM_DB_PASSWORD in .env}
+      POSTGRES_DB: mattermost
+    volumes:
+      - mm_db:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U mmuser -d mattermost"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  mattermost:
+    image: mattermost/mattermost-team-edition:${MATTERMOST_TAG:-latest}
+    restart: unless-stopped
+    depends_on:
+      postgres: { condition: service_healthy }
+    environment:
+      MM_SQLSETTINGS_DRIVERNAME: postgres
+      MM_SQLSETTINGS_DATASOURCE: postgres://mmuser:${MM_DB_PASSWORD}@postgres:5432/mattermost?sslmode=disable&connect_timeout=10
+      MM_SERVICESETTINGS_SITEURL: http://localhost:8065
+      MM_SERVICESETTINGS_ENABLEINCOMINGWEBHOOKS: "true"
+    volumes:
+      - mm_config:/mattermost/config
+      - mm_data:/mattermost/data
+      - mm_logs:/mattermost/logs
+      - mm_plugins:/mattermost/plugins
+    ports:
+      - "127.0.0.1:8065:8065"
+
+  receiver:
+    build: ./receiver
+    restart: unless-stopped
+    depends_on:
+      kafka: { condition: service_healthy }
+    environment:
+      RECEIVER_TOKEN: ${RECEIVER_TOKEN:?set RECEIVER_TOKEN in .env}
+      ALLOWED_REPOSITORY: ${ALLOWED_REPOSITORY:-}
+      KAFKA_BOOTSTRAP: kafka:9092
+    ports:
+      - "127.0.0.1:8000:8000"
+
+  worker:
+    build: ./worker
+    restart: unless-stopped
+    depends_on:
+      kafka: { condition: service_healthy }
+    environment:
+      KAFKA_BOOTSTRAP: kafka:9092
+      MM_WEBHOOK_HIGH: ${MM_WEBHOOK_HIGH:?create the webhook in Mattermost first}
+      MM_WEBHOOK_REVIEW: ${MM_WEBHOOK_REVIEW:?create the webhook in Mattermost first}
+      MM_WEBHOOK_STATUS: ${MM_WEBHOOK_STATUS:?create the webhook in Mattermost first}
+    volumes:
+      - worker_state:/state
+
+volumes:
+  mm_db:
+  mm_config:
+  mm_data:
+  mm_logs:
+  mm_plugins:
+  worker_state:
