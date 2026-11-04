@@ -1,0 +1,220 @@
+# Stage file for chapter 10: the complete pipeline (same as the finished project).
+# Copy it over .github/workflows/pipeline.yml
+# (cp stages/pipeline-ch10.yml .github/workflows/pipeline.yml) and push.
+# The DevSecOps pipeline. It grows one block per chapter; each block is marked.
+#   Chapter 4  secrets (Gitleaks)      Chapter 8   DefectDojo upload
+#   Chapter 5  code (Semgrep)          Chapter 9   alerts through Kafka
+#   Chapter 6  image + SBOM (Trivy)    Chapter 10  gated staging deployment
+#   Chapter 7  the security gate
+name: pipeline
+on:
+  push:
+    branches: [main, testing]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  JUICE_SHOP_TAG: ${{ vars.JUICE_SHOP_TAG || 'v20.3.0' }}
+
+jobs:
+  scan:
+    name: Security scans
+    runs-on: [self-hosted, devsecops]
+    timeout-minutes: 45
+    outputs:
+      image: ${{ steps.image.outputs.ref }}
+    steps:
+      - name: Check out this repository (full history for Gitleaks)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check out OWASP Juice Shop source (the app we scan)
+        uses: actions/checkout@v4
+        with:
+          repository: juice-shop/juice-shop
+          ref: ${{ env.JUICE_SHOP_TAG }}
+          path: app
+          persist-credentials: false
+
+      - name: Prepare the reports folder
+        run: rm -rf reports && mkdir reports
+
+      # --- Chapter 4: secret scanning ---------------------------------------
+      - name: Gitleaks - secrets in this repository and its history
+        run: |
+          docker run --rm -v "$PWD:/repo" -w /repo \
+            -e GIT_CONFIG_COUNT=1 -e GIT_CONFIG_KEY_0=safe.directory -e GIT_CONFIG_VALUE_0='*' \
+            ghcr.io/gitleaks/gitleaks:v8.30.1 \
+            git --redact --report-format json --report-path reports/gitleaks.json --exit-code 0 .
+
+      # --- Chapter 5: static code analysis ----------------------------------
+      - name: Semgrep - code patterns in the Juice Shop source
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src -e SEMGREP_SEND_METRICS=off \
+            semgrep/semgrep:latest \
+            semgrep scan --config p/javascript --config p/typescript --config p/owasp-top-ten \
+              --metrics off --json --output reports/semgrep.json app \
+            || echo "semgrep exited with $? (the gate checks the report)"
+
+      # --- Chapter 6: image scan and SBOM -----------------------------------
+      - name: Resolve the image digest (scan and deploy the same bytes)
+        id: image
+        run: |
+          image="bkimminich/juice-shop:${JUICE_SHOP_TAG}"
+          docker pull --quiet "$image"
+          ref="$(docker image inspect --format '{{index .RepoDigests 0}}' "$image")"
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "Scanning $ref"
+
+      - name: Trivy - known vulnerabilities in the image
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          docker run --rm -v trivy-cache:/root/.cache -v "$PWD/reports:/out" aquasec/trivy:latest \
+            image --scanners vuln --severity HIGH,CRITICAL --format json --output /out/trivy.json "$IMAGE_REF"
+
+      - name: Trivy - SBOM (CycloneDX)
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          docker run --rm -v trivy-cache:/root/.cache -v "$PWD/reports:/out" aquasec/trivy:latest \
+            image --format cyclonedx --output /out/sbom.cdx.json "$IMAGE_REF"
+
+      # --- Chapter 7: the security gate (decision first, details below) -----
+      - name: Security gate - summarise and decide
+        if: ${{ always() }}
+        env:
+          ADVISORY_BRANCHES: ${{ vars.ADVISORY_BRANCHES || 'testing' }}
+          BLOCK_ON_SECRETS: ${{ vars.BLOCK_ON_SECRETS || '1' }}
+          BLOCK_ON_SAST: ${{ vars.BLOCK_ON_SAST || 'high' }}
+          BLOCK_ON_IMAGE: ${{ vars.BLOCK_ON_IMAGE || 'critical' }}
+        run: python3 scripts/gate.py summarize
+
+      - name: Show the findings on the run summary page
+        if: ${{ always() }}
+        run: |
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json, os, collections
+          def load(path):
+              return json.load(open(path)) if os.path.exists(path) and os.path.getsize(path) else None
+          print("## Gitleaks: secrets scan")
+          g = load("reports/gitleaks.json") or []
+          if not g:
+              print("No secrets found in the repository or its history.\n")
+          else:
+              print(f"**{len(g)} possible secret(s) found.** Values are redacted.\n")
+              print("| Rule | File | Line | Commit |")
+              print("| --- | --- | --- | --- |")
+              for i in g:
+                  print(f"| {i.get('RuleID')} | {i.get('File')} | {i.get('StartLine')} | {str(i.get('Commit'))[:8]} |")
+              print()
+          print("## Semgrep: code scan of the Juice Shop source")
+          d = load("reports/semgrep.json")
+          if d is None:
+              print("No Semgrep report was written. Check the Semgrep step log.")
+          else:
+              res = d.get("results", [])
+              sev = collections.Counter(r.get("extra", {}).get("severity", "?") for r in res)
+              print(f"**{len(res)} finding(s):** " + ", ".join(f"{k} {v}" for k, v in sorted(sev.items())) + "\n")
+              rules = collections.Counter(r.get("check_id", "?").split(".")[-1] for r in res)
+              print("| Rule | Findings |")
+              print("| --- | --- |")
+              for name, n in rules.most_common(8):
+                  print(f"| {name} | {n} |")
+              errs = [r for r in res if r.get("extra", {}).get("severity") == "ERROR"]
+              print("\n**Top ERROR findings (file and line):**\n")
+              print("| Rule | File | Line |")
+              print("| --- | --- | --- |")
+              for r in sorted(errs, key=lambda r: (r.get("check_id", ""), r.get("path", "")))[:8]:
+                  print(f"| {r.get('check_id', '?').split('.')[-1]} | {r.get('path', '?')} | {r.get('start', {}).get('line', '?')} |")
+          print("\n## Trivy: known vulnerabilities in the Juice Shop image (HIGH and CRITICAL)")
+          t = load("reports/trivy.json")
+          if t is None:
+              print("No Trivy report was written. Check the Trivy step log.")
+          else:
+              vulns = [v for r in t.get("Results", []) for v in (r.get("Vulnerabilities") or [])]
+              sev = collections.Counter(v.get("Severity", "?") for v in vulns)
+              print(f"**{len(vulns)} finding(s):** " + ", ".join(f"{k} {n}" for k, n in sorted(sev.items())) + "\n")
+              crit = [v for v in vulns if v.get("Severity") == "CRITICAL"]
+              print("**Top CRITICAL findings (package, version, fix):**\n")
+              print("| CVE | Package | Installed | Fixed in |")
+              print("| --- | --- | --- | --- |")
+              for v in sorted(crit, key=lambda v: (v.get("PkgName", ""), v.get("VulnerabilityID", "")))[:8]:
+                  print(f"| {v.get('VulnerabilityID')} | {v.get('PkgName')} | {v.get('InstalledVersion')} | {v.get('FixedVersion') or 'no fix yet'} |")
+          print("\n## SBOM: the ingredient list (CycloneDX)")
+          s = load("reports/sbom.cdx.json")
+          comps = (s or {}).get("components", [])
+          if not comps:
+              print("No SBOM was written. Check the SBOM step log.")
+          else:
+              print(f"**{len(comps)} components** are listed in sbom.cdx.json (saved with the run artifact). A sample:\n")
+              print("| Component | Version |")
+              print("| --- | --- |")
+              for cmp_ in sorted(comps, key=lambda x: x.get("name", ""))[:8]:
+                  print(f"| {cmp_.get('name')} | {cmp_.get('version', '-')} |")
+          PY
+
+      # --- Always: keep the reports and clean up ----------------------------
+      # --- Chapter 8: DefectDojo (reports are uploaded before the final gate) --
+      - name: Upload reports to DefectDojo
+        if: ${{ always() && vars.DOJO_ENABLED == 'true' }}
+        env:
+          DOJO_URL: ${{ vars.DOJO_URL }}
+          DOJO_API_KEY: ${{ secrets.DOJO_API_KEY }}
+        run: python3 scripts/dojo_import.py
+
+      # --- Chapter 9: alerts ------------------------------------------------
+      - name: Send events to the alerts receiver
+        if: ${{ always() && vars.ALERTS_ENABLED == 'true' }}
+        env:
+          ALERTS_URL: ${{ vars.ALERTS_URL }}
+          ALERTS_TOKEN: ${{ secrets.ALERTS_TOKEN }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: python3 scripts/publish_events.py
+
+      - name: Save reports as an artifact
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-reports-${{ github.run_id }}
+          path: reports/
+          retention-days: 14
+
+      - name: Give root-owned files back to the runner user
+        if: ${{ always() }}
+        run: docker run --rm -v "$PWD:/w" alpine:3.20 chown -R "$(id -u):$(id -g)" /w
+
+      # --- Chapter 7: the decision (last step, so reports are always saved) --
+      - name: Security gate - enforce
+        if: ${{ always() }}
+        env:
+          ADVISORY_BRANCHES: ${{ vars.ADVISORY_BRANCHES || 'testing' }}
+        run: python3 scripts/gate.py enforce
+
+  # --- Chapter 10: gated deployment ------------------------------------------
+  deploy:
+    name: Deploy to staging
+    needs: scan
+    # Runs only when the whole scan job passed (the gate is its last step), on a push, with DEPLOY_ENABLED=true.
+    if: ${{ needs.scan.result == 'success' && github.event_name == 'push' && vars.DEPLOY_ENABLED == 'true' }}
+    runs-on: [self-hosted, devsecops]
+    steps:
+      - name: Run the scanned image as staging
+        env:
+          IMAGE_REF: ${{ needs.scan.outputs.image }}
+        run: |
+          docker rm -f staging-juice-shop >/dev/null 2>&1 || true
+          docker run -d --name staging-juice-shop --restart unless-stopped \
+            -p 127.0.0.1:3000:3000 \
+            --label "pipeline.branch=${GITHUB_REF_NAME}" --label "pipeline.run=${GITHUB_RUN_ID}" \
+            "$IMAGE_REF"
+          for _ in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:3000/rest/admin/application-version; then
+              echo; echo "Staging is up: $IMAGE_REF"; exit 0
+            fi
+            sleep 2
+          done
+          echo "Staging did not answer in time"; docker logs --tail 30 staging-juice-shop; exit 1
